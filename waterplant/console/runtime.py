@@ -7,7 +7,7 @@ from waterplant.backwash import Controller
 from waterplant.chlor import Doser as ChlorDoser
 from waterplant.clearwell import Well
 from waterplant.coag import Doser as CoagDoser
-from waterplant.filter import Bank
+from waterplant.filter import Bank, FilterGroupManager
 from waterplant.flow import Calibration
 from waterplant.intake import FlowRepository, InletController, Trend
 from waterplant.inventory import Inventory
@@ -31,7 +31,8 @@ class Runtime:
         self.coag_doser = coag_doser
         self.chlor_doser = ChlorDoser(store)
         self.bank = bank
-        self.backwash = Controller(bank, store)
+        self.filter_groups = FilterGroupManager(store, bank)
+        self.backwash = Controller(bank, store, self.filter_groups)
         self.sampler = Sampler(coag_doser)
         self.calibration = Calibration(store)
         self.well = Well(store)

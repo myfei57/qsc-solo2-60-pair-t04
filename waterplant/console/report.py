@@ -24,6 +24,7 @@ def text_report(rt: Runtime) -> str:
         f"coagulant: {describe['coag']}",
         f"chlorine: {describe['chlor']}",
         f"filter: {describe['filter']}",
+        f"filter groups: {describe['filter_groups']}",
         f"backwash: {describe['backwash']}",
         f"turbidity: {describe['turbidity']}",
         f"flow: {describe['flow']}",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 
@@ -11,7 +12,17 @@ from waterplant.chlor import Doser as ChlorDoser
 from waterplant.chlor import validate_demand
 from waterplant.clearwell import Well, validate_level
 from waterplant.coag import Doser as CoagDoser
-from waterplant.filter import Bank, validate_zone
+from waterplant.filter import (
+    Bank,
+    FilterGroupManager,
+    Assignment,
+    validate_zone,
+)
+from waterplant.filter.group_manager import GROUP_STATE_KEY
+from waterplant.filter.group_report import (
+    PHASE_APPLYING,
+    POLICY_APPLY_NON_CONFLICTING,
+)
 from waterplant.flow import Calibration, calibrate_meter, validate_factor
 from waterplant.intake import FlowRepository, InletController, Sensor, mix, validate_flow
 from waterplant.intake import Trend
@@ -264,6 +275,189 @@ class FilterCase(unittest.TestCase):
             validate_zone(-1)
         with self.assertRaises(ValueError):
             validate_zone(200_000)
+
+
+class FilterGroupCase(unittest.TestCase):
+    def make_manager(self, bank=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Store.open(f"{tmp.name}/groups.json")
+        bank = bank or Bank()
+        manager = FilterGroupManager(store, bank)
+        manager.commission("default", "b1", "F1", 1, 10)
+        manager.commission("default", "b2", "F2", 2, 20)
+        return manager, store, bank
+
+    def assignments(self, manager):
+        return {
+            key: (item.code, item.zone, item.sequence)
+            for key, item in manager.active_assignments().items()
+        }
+
+    def test_triple_is_unique_and_persisted(self) -> None:
+        manager, store, bank = self.make_manager()
+        self.assertEqual(
+            self.assignments(manager),
+            {"b1": ("F1", 1, 10), "b2": ("F2", 2, 20)},
+        )
+        self.assertEqual(bank.mapping(), {1: "b1", 2: "b2"})
+        with self.assertRaises(ValueError):
+            manager.commission("default", "b3", "F3", 2, 30)
+        with self.assertRaises(ValueError):
+            manager.commission("default", "b3", "F1", 3, 30)
+        with self.assertRaises(ValueError):
+            manager.commission("default", "b3", "F3", 3, 10)
+        reopened = FilterGroupManager(Store.open(store.path), Bank())
+        self.assertEqual(
+            self.assignments(reopened),
+            {"b1": ("F1", 1, 10), "b2": ("F2", 2, 20)},
+        )
+
+    def test_complete_reorder_is_atomic_with_crosswalk_and_history(self) -> None:
+        manager, store, bank = self.make_manager()
+        before_history = len(manager.history())
+        revision = manager.reorder(
+            "default",
+            [
+                Assignment("b1", "N1", 2, 20),
+                Assignment("b2", "N2", 1, 10),
+            ],
+        )
+        self.assertEqual(revision["phase"], "active")
+        self.assertEqual(bank.mapping(), {2: "b1", 1: "b2"})
+        self.assertEqual(manager.verify_group("default")["consistent"], True)
+        crosswalk = manager.crosswalk("default", revision["id"])
+        self.assertEqual(crosswalk[0]["old_code"], "F1")
+        self.assertEqual(crosswalk[0]["new_code"], "N1")
+        self.assertEqual(crosswalk[0]["old_zone"], 1)
+        self.assertEqual(crosswalk[0]["new_zone"], 2)
+        self.assertGreater(len(manager.history()), before_history)
+        with self.assertRaises(ValueError):
+            manager.reorder("default", [Assignment("b1", "X1", 3, 1)])
+
+    def test_staged_reorder_keeps_live_and_reader_accepts_old_and_new(self) -> None:
+        manager, _, bank = self.make_manager()
+        manager.set_policy("default", switch_mode="shift_end")
+        staged = manager.reorder(
+            "default",
+            [
+                Assignment("b1", "F1", 3, 10),
+                Assignment("b2", "F2", 4, 20),
+            ],
+        )
+        self.assertEqual(staged["phase"], "staged")
+        self.assertEqual(bank.mapping(), {1: "b1", 2: "b2"})
+        old = manager.resolve("1", group_id="default", revision=staged["parent_id"])
+        new = manager.resolve("3", group_id="default", revision=staged["id"])
+        self.assertEqual(old["bed_id"], "b1")
+        self.assertEqual(new["bed_id"], "b1")
+        self.assertTrue(any(row["label"] == "staged" for row in new["candidates"]))
+        activated = manager.activate("default")
+        self.assertEqual(activated["phase"], "active")
+        self.assertEqual(bank.mapping(), {3: "b1", 4: "b2"})
+
+    def test_conflict_policy_is_fixed_for_batch_and_partial_requests(self) -> None:
+        manager, _, _ = self.make_manager()
+        with self.assertRaises(ValueError):
+            manager.reorder(
+                "default",
+                [Assignment("b1", "F1", 2, 10)],
+                complete=False,
+                conflict_policy=POLICY_APPLY_NON_CONFLICTING,
+            )
+        with self.assertRaises(ValueError):
+            manager.rezone("default", "b1", 2)
+
+        manager.set_policy("default", conflict_policy=POLICY_APPLY_NON_CONFLICTING)
+        result = manager.reorder(
+            "default",
+            [
+                Assignment("b1", "F1", 2, 10),
+                Assignment("b2", "F9", 9, 20),
+            ],
+            complete=False,
+        )
+        self.assertEqual(result["accepted"], ["b2"])
+        self.assertEqual(len(result["conflicts"]), 1)
+        self.assertEqual(result["conflicts"][0]["bed_id"], "b1")
+
+    def test_persisted_applying_revision_recovers_and_reopens_cleanly(self) -> None:
+        manager, store, _ = self.make_manager()
+        revision = manager.reorder(
+            "default",
+            [
+                Assignment("b1", "F1", 2, 10),
+                Assignment("b2", "F2", 1, 20),
+            ],
+        )
+        document = json.loads(store.get(GROUP_STATE_KEY)[0])
+        group = next(item for item in document["groups"] if item["id"] == "default")
+        record = next(
+            item
+            for item in document["revisions"]["default"]
+            if item["id"] == revision["id"]
+        )
+        record["phase"] = PHASE_APPLYING
+        group["active_revision"] = record["id"]
+        store.put(GROUP_STATE_KEY, json.dumps(document, sort_keys=True))
+
+        reopened = FilterGroupManager(Store.open(store.path), Bank())
+        self.assertEqual(reopened.group()["active_revision"], revision["parent_id"])
+        recovered = reopened.recover()
+        self.assertEqual(recovered, [])
+        self.assertEqual(reopened._bank.mapping(), {1: "b1", 2: "b2"})
+
+    def test_rollback_and_repeatable_recovery_restore_consistency(self) -> None:
+        class PartialFailureManager(FilterGroupManager):
+            def __init__(self, store, bank):
+                self._partial_attempts = 0
+                super().__init__(store, bank)
+
+            def _apply_to_bank_locked(self, group_id, prior, target):
+                self._partial_attempts += 1
+                if self._partial_attempts == 1 and self._bank.bed("b1") is not None:
+                    self._bank._beds["b1"].zone = target["b1"].zone
+                    raise RuntimeError("interrupted after first bed")
+                # Failure cleanup reaches the override too; restore directly so
+                # the test can prove a later explicit recovery is idempotent.
+                if self._partial_attempts == 2 and self._bank.bed("b1") is not None:
+                    self._bank._beds["b1"].zone = prior["b1"].zone
+                    return
+                return super()._apply_to_bank_locked(group_id, prior, target)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Store.open(f"{tmp.name}/groups.json")
+        bank = Bank()
+        manager = PartialFailureManager(store, bank)
+        manager.commission("default", "b1", "F1", 1, 10)
+        manager.commission("default", "b2", "F2", 2, 20)
+        manager._partial_attempts = 0
+        with self.assertRaises(RuntimeError):
+            manager.reorder(
+                "default",
+                [
+                    Assignment("b1", "F1", 2, 10),
+                    Assignment("b2", "F2", 1, 20),
+                ],
+            )
+        self.assertEqual(bank.bed_zone("b1"), (2, True))
+        first = manager.recover()
+        second = manager.recover()
+        self.assertEqual(bank.mapping(), {1: "b1", 2: "b2"})
+        self.assertEqual(second, [])
+
+        revision = manager.reorder(
+            "default",
+            [
+                Assignment("b1", "F1", 2, 10),
+                Assignment("b2", "F2", 1, 20),
+            ],
+        )
+        self.assertTrue(manager.rollback("default", revision["id"])["rolled_back"])
+        repeat = manager.rollback("default", revision["id"])
+        self.assertFalse(repeat["rolled_back"])
+        self.assertEqual(bank.mapping(), {1: "b1", 2: "b2"})
 
 
 class BackwashCase(unittest.TestCase):

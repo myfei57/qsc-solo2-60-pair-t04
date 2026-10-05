@@ -45,6 +45,7 @@ class ConsoleCase(unittest.TestCase):
             "intake",
             "ph",
             "inventory",
+            "filter_groups",
         })
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -68,6 +69,7 @@ class ConsoleCase(unittest.TestCase):
                 "schedule",
                 "trend",
                 "inventory",
+                "filter_groups",
             },
         )
 
@@ -188,6 +190,96 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/filter/remove", {"id": "b3"})
         self.assertEqual(body["removed"], "b3")
 
+    def test_filter_group_management_routes(self) -> None:
+        beds = [
+            {"bed_id": "g1", "code": "G1", "zone": 1, "sequence": 1},
+            {"bed_id": "g2", "code": "G2", "zone": 2, "sequence": 2},
+        ]
+        status, body = self.call("POST", "/filter/groups/reorder", {"assignments": beds})
+        self.assertEqual(status, 400)
+
+        for bed in beds:
+            status, _ = self.call("POST", "/filter/add", {"id": bed["bed_id"], "code": bed["code"], "zone": bed["zone"], "sequence": bed["sequence"]})
+            self.assertEqual(status, 200)
+        status, body = self.call("POST", "/filter/renumber", {"id": "g1", "zone": 2})
+        self.assertEqual(status, 409)
+        self.assertIn("already occupied", body["error"])
+
+        status, body = self.call(
+            "POST",
+            "/filter/groups/policy",
+            {"switch_mode": "shift_end", "conflict_policy": "apply_non_conflicting"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["switch_mode"], "shift_end")
+
+        status, body = self.call(
+            "POST",
+            "/filter/groups/reorder",
+            {
+                "assignments": [
+                    {"bed_id": "g1", "code": "G1", "zone": 2, "sequence": 1},
+                    {"bed_id": "g2", "code": "G2", "zone": 1, "sequence": 2},
+                ]
+            },
+        )
+        self.assertEqual(status, 200)
+        staged_id = body["id"]
+        self.assertEqual(body["phase"], "staged")
+
+        status, body = self.call(
+            "POST",
+            "/filter/groups/resolve",
+            {"identifier": "1", "group": "default"},
+        )
+        self.assertEqual(status, 409)
+        self.assertTrue(body["ambiguous"])
+        status, old = self.call(
+            "POST",
+            "/filter/groups/resolve",
+            {"identifier": "1", "group": "default", "revision": staged_id - 1},
+        )
+        self.assertEqual(old["bed_id"], "g1")
+        status, new = self.call(
+            "POST",
+            "/filter/groups/resolve",
+            {"identifier": "G1", "group": "default", "revision": staged_id},
+        )
+        self.assertEqual(new["bed_id"], "g1")
+
+        status, body = self.call("POST", "/filter/groups/activate", {"revision": staged_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["phase"], "active")
+        status, body = self.call("POST", "/backwash/select", {"zone": 1})
+        self.assertEqual(body["bed"], "g2")
+
+        status, body = self.call(
+            "POST",
+            "/filter/groups/reorder",
+            {
+                "complete": False,
+                "assignments": [
+                    {"bed_id": "g1", "code": "G9", "zone": 1, "sequence": 9},
+                    {"bed_id": "g2", "code": "G2", "zone": 9, "sequence": 2},
+                ],
+                "switch_mode": "immediate",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["accepted"], ["g2"])
+        self.assertEqual(body["conflicts"][0]["bed_id"], "g1")
+
+        status, body = self.call("POST", "/filter/groups/verify")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["consistent"])
+        status, body = self.call("POST", "/filter/groups/history", {"group": "default"})
+        self.assertGreaterEqual(body["count"], 6)
+        status, body = self.call("POST", "/filter/groups/rollback", {"revision": body["events"][-1]["revision"]})
+        self.assertEqual(status, 200)
+        status, body = self.call("POST", "/filter/groups/recover")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 0)
+
     def test_quota_and_audit_routes(self) -> None:
         status, body = self.call("POST", "/quota/add", {"amount": 40.0})
         self.assertEqual(body["value"], 40.0)
@@ -261,8 +353,8 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["threshold"], 6.0)
         self.assertEqual(body["due"], [])
 
-        for bed_id, load in (("b1", 2.0), ("b2", 9.0)):
-            self.call("POST", "/filter/add", {"id": bed_id, "zone": 1, "load": load})
+        for bed_id, zone, load in (("b1", 1, 2.0), ("b2", 2, 9.0)):
+            self.call("POST", "/filter/add", {"id": bed_id, "zone": zone, "load": load})
         status, body = self.call("GET", "/schedule")
         self.assertEqual(body["due"], ["b2"])
         status, body = self.call("POST", "/schedule/plan", {})

@@ -36,4 +36,16 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
         )
     else:
         checks.append({"name": "inventory", "status": "ok", "detail": "stock above reorder level"})
+    inconsistent: list[str] = []
+    for group in rt.filter_groups.groups():
+        try:
+            rt.filter_groups.verify_group(str(group["id"]))
+        except ValueError:
+            inconsistent.append(str(group["id"]))
+    if inconsistent:
+        checks.append(
+            {"name": "filter_groups", "status": "fail", "detail": "inconsistent " + ", ".join(inconsistent)}
+        )
+    else:
+        checks.append({"name": "filter_groups", "status": "ok", "detail": "crosswalks verified"})
     return checks

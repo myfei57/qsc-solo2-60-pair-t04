@@ -21,6 +21,9 @@ class Bank:
 
     def add_bed(self, bed_id: str, zone: int, load: float = 0.0) -> Bed:
         with self._lock:
+            if bed_id in self._beds:
+                raise ValueError(f"filter bed {bed_id} already exists")
+            self._reject_zone_locked(zone)
             bed = Bed(id=bed_id, zone=zone, load=load)
             self._beds[bed_id] = bed
             return bed
@@ -62,7 +65,43 @@ class Bank:
 
     def renumber(self, bed_id: str, zone: int) -> None:
         with self._lock:
+            self._reject_zone_locked(zone, bed_id)
             self._require(bed_id).zone = zone
+
+    def apply_zone_map(self, zones: dict[str, int]) -> None:
+        """Atomically move many beds while never assigning one zone twice."""
+
+        with self._lock:
+            wanted: dict[str, int] = {}
+            for raw_bed_id, raw_zone in zones.items():
+                bed_id = str(raw_bed_id)
+                zone = int(raw_zone)
+                if zone < 0 or zone > 100_000:
+                    raise ValueError("zone exceeds the supported range")
+                if bed_id not in self._beds:
+                    raise ValueError(f"filter bed {bed_id} not found")
+                wanted[bed_id] = zone
+            seen: dict[int, str] = {}
+            for bed_id, zone in wanted.items():
+                owner = seen.get(zone)
+                if owner is not None:
+                    raise ValueError(f"zone {zone} occupied by {owner} and {bed_id}")
+                seen[zone] = bed_id
+            temporary: dict[str, int] = {}
+            next_zone = max((bed.zone for bed in self._beds.values()), default=100_000) + 1
+            for bed_id, target in wanted.items():
+                while next_zone in {bed.zone for bed in self._beds.values()} or next_zone in temporary.values():
+                    next_zone += 1
+                temporary[bed_id] = next_zone
+                self._beds[bed_id].zone = next_zone
+                next_zone += 1
+            for bed_id, target in wanted.items():
+                self._beds[bed_id].zone = target
+
+    def _reject_zone_locked(self, zone: int, bed_id: str | None = None) -> None:
+        for existing_id, bed in self._beds.items():
+            if bed.zone == zone and existing_id != bed_id:
+                raise ValueError(f"zone {zone} is already occupied by {existing_id}")
 
     def mapping(self) -> dict[int, str]:
         """Zone to bed identifier, rebuilt from the live bed registry."""

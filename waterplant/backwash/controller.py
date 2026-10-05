@@ -22,9 +22,10 @@ SPILL_KEY = "backwash:spill"
 class Controller:
     """Sequences backwash commands against the filter bank."""
 
-    def __init__(self, bank: Bank, store: Store) -> None:
+    def __init__(self, bank: Bank, store: Store, group_manager=None) -> None:
         self._bank = bank
         self._store = store
+        self._group_manager = group_manager
 
     def start(self, bed_id: str) -> None:
         """Close the bed and only then open its drain."""
@@ -59,9 +60,17 @@ class Controller:
     def pending_count(self) -> int:
         return len(self.command_list())
 
-    def select(self, zone: int) -> str:
-        """Resolve the bed that currently occupies a zone."""
+    def select(self, zone: int, group_id: str = "default") -> str:
+        """Resolve the bed that currently occupies a zone within one group."""
 
+        if self._group_manager is None:
+            return self._select_bank_zone(zone)
+        for bed_id, assignment in self._group_manager.active_assignments(group_id).items():
+            if assignment.zone == zone:
+                return bed_id
+        raise ValueError(f"no filter bed for zone {zone} in group {group_id}")
+
+    def _select_bank_zone(self, zone: int) -> str:
         mapping = self._bank.mapping()
         if zone not in mapping:
             raise ValueError(f"no filter bed for zone {zone}")

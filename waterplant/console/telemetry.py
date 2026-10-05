@@ -14,6 +14,10 @@ class Telemetry:
     store_keys: int
     filter_beds: int
     filter_active: int
+    filter_groups: int
+    filter_staged: int
+    filter_revisions: int
+    filter_group_events: int
     filter_load: float
     backwash_queue: int
     backwash_drains: int
@@ -36,6 +40,10 @@ class Telemetry:
             "store_keys": self.store_keys,
             "filter_beds": self.filter_beds,
             "filter_active": self.filter_active,
+            "filter_groups": self.filter_groups,
+            "filter_staged": self.filter_staged,
+            "filter_revisions": self.filter_revisions,
+            "filter_group_events": self.filter_group_events,
             "filter_load": self.filter_load,
             "backwash_queue": self.backwash_queue,
             "backwash_drains": self.backwash_drains,
@@ -58,10 +66,15 @@ class Telemetry:
 def collect(rt: Runtime) -> Telemetry:
     """Read every counter without mutating the control state."""
 
+    groups = rt.filter_groups.groups()
     return Telemetry(
         store_keys=rt.store.count(),
         filter_beds=rt.bank.count(),
         filter_active=rt.bank.active_count(),
+        filter_groups=len(groups),
+        filter_staged=sum(1 for group in groups if group.get("staged_revision") is not None),
+        filter_revisions=sum(len(rt.filter_groups.revisions(str(group["id"]))) for group in groups),
+        filter_group_events=len(rt.filter_groups.history()),
         filter_load=rt.bank.total_load(),
         backwash_queue=rt.backwash.pending_count(),
         backwash_drains=rt.backwash.drain_count(),

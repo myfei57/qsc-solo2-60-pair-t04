@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING
 
 from waterplant.chlor import validate_demand
 from waterplant.clearwell import validate_level
-from waterplant.filter import validate_zone
+from waterplant.filter import (
+    Assignment,
+    GroupConflictError,
+    validate_zone,
+)
+from waterplant.filter.group_report import DEFAULT_GROUP_ID
 from waterplant.flow import calibrate_meter, validate_factor
 from waterplant.intake import DEFAULT_WINDOW, Sensor, validate_flow
 from waterplant.inventory import validate_quantity
@@ -23,7 +28,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -31,6 +36,29 @@ from .version import version_payload
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from .server import Server
+
+
+def _group_for_bed(server: "Server", bed_id: str) -> str:
+    for group in server.runtime.filter_groups.groups():
+        if any(item["bed_id"] == bed_id for item in group["assignments"]):
+            return str(group["id"])
+    raise ValueError(f"filter bed {bed_id} not found")
+
+
+def _request_assignments(request: Request) -> list[Assignment]:
+    raw = request.payload.get("assignments", [])
+    if not isinstance(raw, list):
+        raise RequestError(400, "field assignments must be a list")
+    assignments: list[Assignment] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise RequestError(400, f"assignment {index} must be an object")
+        assignments.append(Assignment.from_payload(item))
+    return assignments
+
+
+def _conflict_response(exc: GroupConflictError) -> "RequestError":
+    return RequestError(409, str(exc))
 
 
 def health(server: "Server", request: Request) -> Response:
@@ -164,10 +192,39 @@ def clearwell_level(server: "Server", request: Request) -> Response:
 def filter_add(server: "Server", request: Request) -> Response:
     zone = request.int_field("zone")
     validate_zone(zone)
-    bed = server.runtime.bank.add_bed(
-        request.str_field("id"), zone, request.float_field("load")
+    bed_id = request.str_field("id")
+    code = request.str_field("code", bed_id)
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    active = server.runtime.filter_groups.group(group_id)["assignments"]
+    sequence = request.int_field(
+        "sequence", max((int(item["sequence"]) for item in active), default=0) + 1
     )
-    return json_response({"id": bed.id, "zone": bed.zone, "load": bed.load})
+    load = request.float_field("load")
+    if load < 0:
+        raise ValueError("load must be non-negative")
+    try:
+        revision = server.runtime.filter_groups.commission(
+            group_id=group_id,
+            bed_id=bed_id,
+            code=code,
+            zone=zone,
+            sequence=sequence,
+        )
+    except GroupConflictError as exc:
+        raise RequestError(409, str(exc)) from exc
+    bed = server.runtime.bank.bed(bed_id)
+    if bed is not None and load:
+        server.runtime.bank.set_load(bed_id, load)
+    return json_response(
+        {
+            "id": bed_id,
+            "code": code,
+            "zone": zone,
+            "sequence": sequence,
+            "load": load,
+            "revision": revision["id"],
+        }
+    )
 
 
 def filter_close(server: "Server", request: Request) -> Response:
@@ -186,8 +243,14 @@ def filter_renumber(server: "Server", request: Request) -> Response:
     zone = request.int_field("zone")
     validate_zone(zone)
     bed_id = request.str_field("id")
-    server.runtime.bank.renumber(bed_id, zone)
-    return json_response({"renumbered": bed_id, "zone": zone})
+    group_id = _group_for_bed(server, bed_id)
+    try:
+        revision = server.runtime.filter_groups.rezone(group_id, bed_id, zone)
+    except GroupConflictError as exc:
+        raise RequestError(409, str(exc)) from exc
+    return json_response(
+        {"renumbered": bed_id, "zone": zone, "revision": revision["id"]}
+    )
 
 
 def filter_load(server: "Server", request: Request) -> Response:
@@ -206,14 +269,178 @@ def filter_reset(server: "Server", request: Request) -> Response:
 
 def filter_remove(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
-    server.runtime.bank.remove_bed(bed_id)
-    return json_response({"removed": bed_id})
+    group_id = _group_for_bed(server, bed_id)
+    revision = server.runtime.filter_groups.decommission(group_id, bed_id)
+    return json_response({"removed": bed_id, "revision": revision["id"]})
 
 
 def filter_zone(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
     zone, present = server.runtime.bank.bed_zone(bed_id)
     return json_response({"id": bed_id, "zone": zone, "ok": present})
+
+
+def filter_group_list(server: "Server", request: Request) -> Response:
+    return json_response({"groups": server.runtime.filter_groups.groups()})
+
+
+def filter_group_get(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    return json_response(server.runtime.filter_groups.group(group_id))
+
+
+def filter_group_create(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("id", DEFAULT_GROUP_ID)
+    try:
+        group = server.runtime.filter_groups.create_group(
+            group_id=group_id,
+            name=request.str_field("name", group_id),
+            switch_mode=request.str_field("switch_mode", "immediate"),
+            conflict_policy=request.str_field("conflict_policy", "reject_batch"),
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(group)
+
+
+def filter_group_policy(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    switch_mode = request.payload.get("switch_mode")
+    conflict_policy = request.payload.get("conflict_policy")
+    try:
+        group = server.runtime.filter_groups.set_policy(
+            group_id,
+            switch_mode=str(switch_mode) if switch_mode is not None else None,
+            conflict_policy=str(conflict_policy) if conflict_policy is not None else None,
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(group)
+
+
+def filter_group_reorder(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    complete = bool(request.payload.get("complete", True))
+    assignments = _request_assignments(request)
+    switch_mode = request.payload.get("switch_mode")
+    conflict_policy = request.payload.get("conflict_policy")
+    try:
+        revision = server.runtime.filter_groups.reorder(
+            group_id=group_id,
+            assignments=assignments,
+            complete=complete,
+            reason=request.str_field("reason", "reorder"),
+            switch_mode=str(switch_mode) if switch_mode is not None else None,
+            conflict_policy=str(conflict_policy) if conflict_policy is not None else None,
+        )
+    except GroupConflictError as exc:
+        raise _conflict_response(exc) from exc
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(revision)
+
+
+def filter_group_activate(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    revision_id = request.payload.get("revision")
+    try:
+        revision = server.runtime.filter_groups.activate(
+            group_id, int(revision_id) if revision_id is not None else None
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(revision)
+
+
+def filter_group_cancel(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    revision_id = request.payload.get("revision")
+    try:
+        revision = server.runtime.filter_groups.cancel_staged(
+            group_id, int(revision_id) if revision_id is not None else None
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(revision)
+
+
+def filter_group_rollback(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    revision_id = request.payload.get("revision")
+    try:
+        result = server.runtime.filter_groups.rollback(
+            group_id, int(revision_id) if revision_id is not None else None
+        )
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(result)
+
+
+def filter_group_recover(server: "Server", request: Request) -> Response:
+    group_id = request.payload.get("group")
+    recovered = server.runtime.filter_groups.recover(
+        str(group_id) if group_id is not None else None
+    )
+    return json_response({"recovered": recovered, "count": len(recovered)})
+
+
+def filter_group_verify(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    try:
+        verification = server.runtime.filter_groups.verify_group(group_id)
+    except GroupConflictError as exc:
+        raise RequestError(409, str(exc)) from exc
+    except ValueError as exc:
+        raise RequestError(400, str(exc)) from exc
+    return json_response(verification)
+
+
+def filter_group_crosswalk(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    revision_id = request.payload.get("revision")
+    rows = server.runtime.filter_groups.crosswalk(
+        group_id, int(revision_id) if revision_id is not None else None
+    )
+    return json_response({"crosswalk": rows, "count": len(rows)})
+
+
+def filter_group_revisions(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    revisions = server.runtime.filter_groups.revisions(group_id)
+    return json_response({"revisions": revisions, "count": len(revisions)})
+
+
+def filter_group_revision(server: "Server", request: Request) -> Response:
+    group_id = request.str_field("group", DEFAULT_GROUP_ID)
+    return json_response(
+        server.runtime.filter_groups.revision(group_id, request.int_field("revision"))
+    )
+
+
+def filter_group_history(server: "Server", request: Request) -> Response:
+    group_id = request.payload.get("group")
+    events = server.runtime.filter_groups.history(
+        str(group_id) if group_id is not None else None
+    )
+    return json_response({"events": events, "count": len(events)})
+
+
+def filter_group_resolve(server: "Server", request: Request) -> Response:
+    group_id = request.payload.get("group")
+    code = request.payload.get("code")
+    zone = request.payload.get("zone")
+    sequence = request.payload.get("sequence")
+    revision_id = request.payload.get("revision")
+    result = server.runtime.filter_groups.resolve(
+        identifier=request.str_field("identifier"),
+        group_id=str(group_id) if group_id is not None else None,
+        code=str(code) if code is not None else None,
+        zone=int(zone) if zone is not None else None,
+        sequence=int(sequence) if sequence is not None else None,
+        revision=int(revision_id) if revision_id is not None else None,
+    )
+    status = 409 if result.get("ambiguous") else 200
+    return json_response(result, status=status)
 
 
 def backwash_start(server: "Server", request: Request) -> Response:

@@ -68,6 +68,7 @@ class ConsoleCase(unittest.TestCase):
                 "schedule",
                 "trend",
                 "inventory",
+                "filtergroup",
             },
         )
 
@@ -371,6 +372,79 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/filter/close", {"id": "ghost"})
         self.assertEqual(status, 400)
         self.assertIn("not found", body["error"])
+
+    def test_filtergroup_end_to_end(self) -> None:
+        boot_rows = [
+            {"pool_id": "P-A", "code": "1#", "zone": 1, "sequence": 1},
+            {"pool_id": "P-B", "code": "2#", "zone": 2, "sequence": 2},
+            {"pool_id": "P-C", "code": "3#", "zone": 3, "sequence": 3},
+        ]
+        status, body = self.call("POST", "/filtergroup/bootstrap", {"rows": boot_rows})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["effective_version"], "V1")
+
+        # 切换时机/冲突策略必须显式给，缺省一律 400。
+        status, body = self.call("POST", "/filtergroup/plan", {"rows": boot_rows})
+        self.assertEqual(status, 400)
+
+        # REJECT_BATCH：两个池抢同一分区 -> 409 且带冲突明细。
+        clash = [
+            {"pool_id": "P-A", "code": "5#", "zone": 5, "sequence": 5},
+            {"pool_id": "P-B", "code": "5#", "zone": 5, "sequence": 5},
+            {"pool_id": "P-C", "code": "3#", "zone": 3, "sequence": 3},
+        ]
+        status, body = self.call(
+            "POST", "/filtergroup/plan",
+            {"rows": clash, "switch": "IMMEDIATE", "policy": "REJECT_BATCH"},
+        )
+        self.assertEqual(status, 409)
+        self.assertTrue(body["rejected"])
+        self.assertTrue(body["conflicts"])
+
+        # SHIFT_END：挂起后新旧号并存，值班记录照写，班末再切。
+        shift_rows = [
+            {"pool_id": "P-A", "code": "2#", "zone": 2, "sequence": 2},
+            {"pool_id": "P-B", "code": "1#", "zone": 1, "sequence": 1},
+            {"pool_id": "P-C", "code": "3#", "zone": 3, "sequence": 3},
+        ]
+        status, plan = self.call(
+            "POST", "/filtergroup/plan",
+            {"rows": shift_rows, "switch": "SHIFT_END", "policy": "REJECT_BATCH"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(plan["status"], "ARMED")
+        plan_id = plan["plan_id"]
+
+        status, body = self.call("POST", "/filtergroup/duty",
+                                 {"code": "3#", "action": "BACKWASH"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["version"], "V1")
+
+        status, body = self.call("POST", "/filtergroup/resolve", {"code": "3#"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["pool_id"], "P-C")
+
+        status, body = self.call("POST", "/filtergroup/activate", {"plan_id": plan_id})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "EFFECTIVE")
+
+        # 历史记录未被回改；翻译旧号到新版本。
+        status, body = self.call("GET", "/filtergroup/duty")
+        self.assertEqual(body["records"][0]["code_raw"], "3#")
+        self.assertEqual(body["records"][0]["version"], "V1")
+        status, body = self.call(
+            "POST", "/filtergroup/translate",
+            {"code": "1#", "from_version": "V1", "to_version": "V2"},
+        )
+        self.assertEqual(body["pool_id"], "P-A")
+        self.assertEqual(body["code_at_target"], "2#")
+
+        status, body = self.call("GET", "/filtergroup/audit")
+        self.assertEqual(status, 200)
+        actions = {entry["action"] for entry in body["entries"]}
+        self.assertIn("PLAN_SUBMIT", actions)
+        self.assertIn("PLAN_EFFECTIVE", actions)
+        self.assertIn("DUTY_RECORD", actions)
 
 
 class WsgiCase(unittest.TestCase):

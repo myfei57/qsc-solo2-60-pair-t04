@@ -23,6 +23,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
+from . import filtergroup as filtergroup_handlers
 from .http import Request, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
@@ -385,3 +386,22 @@ def export_audit(server: "Server", request: Request) -> Response:
 def export_telemetry(server: "Server", request: Request) -> Response:
     columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
     return csv_response(to_csv(columns, rows))
+
+
+# ---------------------------------------------------------------------------
+# 池组与分区管理：路由表里的 handler 名从本模块解析，统一转发到
+# console/filtergroup.py，保持与其余端点同样的分发方式。
+# ---------------------------------------------------------------------------
+filtergroup_layout = filtergroup_handlers.filtergroup_layout
+filtergroup_bootstrap = filtergroup_handlers.filtergroup_bootstrap
+filtergroup_plan_submit = filtergroup_handlers.filtergroup_plan_submit
+filtergroup_plans = filtergroup_handlers.filtergroup_plans
+filtergroup_plan = filtergroup_handlers.filtergroup_plan
+filtergroup_activate = filtergroup_handlers.filtergroup_activate
+filtergroup_cancel = filtergroup_handlers.filtergroup_cancel
+filtergroup_recover = filtergroup_handlers.filtergroup_recover
+filtergroup_resolve = filtergroup_handlers.filtergroup_resolve
+filtergroup_translate = filtergroup_handlers.filtergroup_translate
+filtergroup_duty_append = filtergroup_handlers.filtergroup_duty_append
+filtergroup_duty_list = filtergroup_handlers.filtergroup_duty_list
+filtergroup_audit = filtergroup_handlers.filtergroup_audit

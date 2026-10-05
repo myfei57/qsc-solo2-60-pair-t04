@@ -8,6 +8,7 @@ from waterplant.chlor import Doser as ChlorDoser
 from waterplant.clearwell import Well
 from waterplant.coag import Doser as CoagDoser
 from waterplant.filter import Bank
+from waterplant.filtergroup import GroupManager
 from waterplant.flow import Calibration
 from waterplant.intake import FlowRepository, InletController, Trend
 from waterplant.inventory import Inventory
@@ -41,3 +42,4 @@ class Runtime:
         self.scheduler = Scheduler(store)
         self.trend = Trend(store)
         self.inventory = Inventory(store)
+        self.filtergroup = GroupManager(store)

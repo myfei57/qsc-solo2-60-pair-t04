@@ -89,6 +89,19 @@ def route_table() -> list[Route]:
         Route("POST", "/metrics/reset", "reset console request counters", "metrics_reset"),
         Route("GET", "/export/audit", "dosing audit trail as CSV", "export_audit"),
         Route("GET", "/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
+        Route("GET", "/filtergroup/layout", "filter group current layout", "filtergroup_layout"),
+        Route("POST", "/filtergroup/bootstrap", "create the first filter group version", "filtergroup_bootstrap"),
+        Route("POST", "/filtergroup/plan", "submit a whole group renumbering plan", "filtergroup_plan_submit"),
+        Route("GET", "/filtergroup/plans", "list renumbering plans and step progress", "filtergroup_plans"),
+        Route("GET", "/filtergroup/plan", "fetch one renumbering plan", "filtergroup_plan"),
+        Route("POST", "/filtergroup/activate", "activate a shift-end plan at shift change", "filtergroup_activate"),
+        Route("POST", "/filtergroup/cancel", "cancel a pending renumbering plan", "filtergroup_cancel"),
+        Route("POST", "/filtergroup/recover", "resume a partially failed renumbering", "filtergroup_recover"),
+        Route("POST", "/filtergroup/resolve", "resolve new or old pool code and zone", "filtergroup_resolve"),
+        Route("POST", "/filtergroup/translate", "translate a historical code to a version", "filtergroup_translate"),
+        Route("POST", "/filtergroup/duty", "append an immutable duty log entry", "filtergroup_duty_append"),
+        Route("GET", "/filtergroup/duty", "list immutable duty log entries", "filtergroup_duty_list"),
+        Route("GET", "/filtergroup/audit", "filter group change audit trail", "filtergroup_audit"),
     ]
 
 
